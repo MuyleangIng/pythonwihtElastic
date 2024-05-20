@@ -3,93 +3,81 @@ import requests
 import logging
 import json
 import time
+from psycopg2.extras import DictCursor
+from requests.exceptions import HTTPError
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# PostgreSQL connection details
-pg_conn = psycopg2.connect(
-    dbname="mydatabase",
-    user="user",
-    password="12345678",
-    host="postgres",  # Using Docker service name
-    port="5432"
-)
+def connect_to_postgres():
+    """Establishes a PostgreSQL connection."""
+    return psycopg2.connect(
+        dbname="alumni_db",
+        user="postgres",
+        password="qwerty",
+        host="152.42.163.114",  # Using Docker service name
+        port="5434"
+    )
 
-# Elasticsearch connection details
-es_url = 'http://elasticsearch:9200/students/_bulk'
-headers = {"Content-Type": "application/x-ndjson"}
+def connect_to_elasticsearch():
+    """Returns Elasticsearch bulk URL and headers."""
+    return 'http://elasticsearch:9200/user_details/_bulk', {"Content-Type": "application/x-ndjson"}
 
-# Track the highest ID that has been synced to avoid resyncing the same data
-last_synced_id = 0
-
-def fetch_data(last_id):
+def fetch_all_data(pg_conn):
+    """Fetch all user details from PostgreSQL."""
     try:
-        cursor = pg_conn.cursor()
-        cursor.execute("""
-            SELECT student_id, name, title, skills, deleted
-            FROM students
-            WHERE student_id > %s
-            ORDER BY student_id ASC
-        """, (last_id,))
-        rows = cursor.fetchall()
-        cursor.close()
-        logger.debug("Database rows fetched: %s", rows)
-        return rows
+        with pg_conn.cursor(cursor_factory=DictCursor) as cursor:
+            cursor.execute("""
+                SELECT id, achievements, address, educations, email, first_name, gender, interests, languages, last_name, nationality, skills, telephone, work_experiences, generation_id, user_id
+                FROM al_user_details
+                ORDER BY id ASC  -- Ensuring a consistent order
+            """)
+            return cursor.fetchall()
     except Exception as e:
         logger.error("Error fetching data from PostgreSQL: %s", e)
         raise
 
 def format_data(rows):
+    """Formats rows into a bulk JSON action list for Elasticsearch."""
     actions = []
     for row in rows:
-        if row[4]:  # If the deleted flag is true
-            action = {
-                "delete": {
-                    "_index": "students",
-                    "_id": row[0]  # Assuming student_id is the first column
-                }
+        action = {
+            "index": {
+                "_index": "user_details",
+                "_id": row['id']
             }
-        else:
-            action = {
-                "index": {
-                    "_index": "students",
-                    "_id": row[0]  # Assuming student_id is the first column
-                }
-            }
-            doc = {
-                "student_id": row[0],
-                "name": row[1],
-                "title": row[2],
-                "skills": row[3]
-            }
-            actions.append(json.dumps(action))
-            actions.append(json.dumps(doc))
+        }
+        doc = {key: row[key] for key in row.keys() if key != 'id'}
+        actions.append(json.dumps(action))
+        actions.append(json.dumps(doc))
     return "\n".join(actions) + "\n"
 
-def sync_data():
-    global last_synced_id
+def sync_data(pg_conn, es_url, headers):
+    """Synchronizes data from PostgreSQL to Elasticsearch."""
     try:
-        rows = fetch_data(last_synced_id)
+        rows = fetch_all_data(pg_conn)
         if not rows:
             logger.debug("No new data to sync.")
             return
 
         bulk_data = format_data(rows)
-        logger.debug("Bulk data to be inserted/updated: %s", bulk_data)
         response = requests.post(es_url, headers=headers, data=bulk_data)
         response.raise_for_status()
-        logger.debug("Bulk insert/update response: %s", response.json())
-
-        # Update the last_synced_id
-        last_synced_id = rows[-1][0]
-        logger.debug("Updated last_synced_id: %s", last_synced_id)
+        logger.debug("Data successfully synchronized to Elasticsearch.")
+    except HTTPError as e:
+        logger.error("HTTP error during sync: %s", e.response.text)
+        raise
     except Exception as e:
         logger.error("Error during sync: %s", e)
         raise
 
 if __name__ == "__main__":
-    while True:
-        sync_data()
-        time.sleep(10)  # Poll every 10 seconds
+    pg_conn = connect_to_postgres()
+    es_url, headers = connect_to_elasticsearch()
+    try:
+        while True:
+            sync_data(pg_conn, es_url, headers)
+            time.sleep(10)  # Poll every 10 seconds
+    finally:
+        pg_conn.close()
